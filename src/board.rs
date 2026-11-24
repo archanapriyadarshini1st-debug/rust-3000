@@ -117,8 +117,9 @@ impl Position {
         for c in board.bytes() {
             match c {
                 b'/' => {
+                    // A slash must terminate a complete rank.
                     if file != 8 || rank == 0 {
-                        // rank may be 0 at the very end; handled below
+                        return None;
                     }
                     rank -= 1;
                     file = 0;
@@ -422,3 +423,35 @@ pub fn parse_uci_move(pos: &Position, token: &str) -> Option<Move> {
     None
 }
 
+
+
+#[cfg(test)]
+mod fen_validation_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_valid_start_position() {
+        assert!(Position::from_fen(START_FEN).is_some());
+    }
+
+    #[test]
+    fn rejects_incomplete_or_empty_ranks() {
+        for fen in [
+            "7/8/8/8/8/8/8/8 w - - 0 1",
+            "8/7/8/8/8/8/8/8 w - - 0 1",
+            "8//8/8/8/8/8/8 w - - 0 1",
+        ] {
+            assert!(Position::from_fen(fen).is_none(), "accepted malformed FEN: {fen}");
+        }
+    }
+
+    #[test]
+    fn rejects_overfilled_ranks() {
+        for fen in [
+            "5PPP/8/8/8/8/8/8/8 w - - 0 1",
+            "8/8/8/8/8/8/8/4K4 w - - 0 1",
+        ] {
+            assert!(Position::from_fen(fen).is_none(), "accepted malformed FEN: {fen}");
+        }
+    }
+}

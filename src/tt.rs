@@ -57,12 +57,12 @@ pub struct TranspositionTable {
 
 impl TranspositionTable {
     pub fn new(mb: usize) -> TranspositionTable {
-        let bytes = mb.max(1) * 1024 * 1024;
-        let mut n = 1usize;
-        while n * std::mem::size_of::<Entry>() * 2 < bytes {
-            n *= 2;
-        }
-        n = n.max(1024);
+        let bytes = mb.max(1).saturating_mul(1024 * 1024);
+        let max_entries = (bytes / std::mem::size_of::<Entry>()).max(1024);
+        // Keep a power-of-two table for mask indexing without rounding
+        // upward beyond the requested Hash memory budget.
+        let shift = usize::BITS - 1 - max_entries.leading_zeros();
+        let n = (1usize << shift).max(1024);
         let mut table = Vec::with_capacity(n);
         for _ in 0..n {
             table.push(Entry::empty());
@@ -160,5 +160,19 @@ pub fn from_tt(score: i32, ply: i32) -> i32 {
         score + ply
     } else {
         score
+    }
+}
+
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    fn hash_option_uses_actual_entry_size_and_respects_budget() {
+        let table = TranspositionTable::new(3);
+        let bytes = table.table.len() * std::mem::size_of::<Entry>();
+        assert!(bytes <= 3 * 1024 * 1024, "allocated {bytes} bytes for a 3 MiB Hash");
+        assert_eq!(bytes, 2 * 1024 * 1024);
     }
 }

@@ -67,6 +67,10 @@ impl Network {
         if bytes.len() < HEADER || &bytes[0..4] != b"CRN1" {
             return Err("no net (bad magic / empty)".into());
         }
+        let version = rd_u32(bytes, 4);
+        if version != 1 {
+            return Err(format!("unsupported net version {version}"));
+        }
         let (h, b, f) = (
             rd_u32(bytes, 8) as usize,
             rd_u32(bytes, 12) as usize,
@@ -148,6 +152,50 @@ impl Network {
         (out as i32).clamp(-MAX_EVAL, MAX_EVAL)
     }
 
+    /// Vectorized AVX2 output layer. The arithmetic uses 32-bit integer lanes
+    /// and a wrapping horizontal reduction, matching the scalar integer path.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn output_avx2(
+        &self,
+        acc_us: &[i32; HIDDEN],
+        acc_th: &[i32; HIDDEN],
+        pos: &Position,
+    ) -> i32 {
+        use std::arch::x86_64::*;
+
+        let piece_count = (pos.colors[0] | pos.colors[1]).count_ones() as usize;
+        let bucket = (piece_count.saturating_sub(2) / 4).min(BUCKETS - 1);
+        let w = &self.out_w[bucket * 2 * HIDDEN..(bucket + 1) * 2 * HIDDEN];
+        let zero = _mm256_setzero_si256();
+        let max = _mm256_set1_epi32(QA);
+        let mut lanes = _mm256_setzero_si256();
+
+        for i in (0..HIDDEN).step_by(8) {
+            let us = _mm256_loadu_si256(acc_us.as_ptr().add(i) as *const __m256i);
+            let them = _mm256_loadu_si256(acc_th.as_ptr().add(i) as *const __m256i);
+            let us = _mm256_min_epi32(_mm256_max_epi32(us, zero), max);
+            let them = _mm256_min_epi32(_mm256_max_epi32(them, zero), max);
+
+            let us_w = _mm_loadu_si128(w.as_ptr().add(i) as *const __m128i);
+            let them_w = _mm_loadu_si128(w.as_ptr().add(HIDDEN + i) as *const __m128i);
+            let us_w = _mm256_cvtepi16_epi32(us_w);
+            let them_w = _mm256_cvtepi16_epi32(them_w);
+
+            let us_sq = _mm256_mullo_epi32(us, us);
+            let them_sq = _mm256_mullo_epi32(them, them);
+            lanes = _mm256_add_epi32(lanes, _mm256_mullo_epi32(us_sq, us_w));
+            lanes = _mm256_add_epi32(lanes, _mm256_mullo_epi32(them_sq, them_w));
+        }
+
+        let mut partial = [0i32; 8];
+        _mm256_storeu_si256(partial.as_mut_ptr() as *mut __m256i, lanes);
+        let sum = partial.into_iter().fold(0i32, i32::wrapping_add);
+        let out = (sum / QA + self.out_b[bucket]) as i64 * SCALE as i64
+            / (QA * QB) as i64;
+        (out as i32).clamp(-MAX_EVAL, MAX_EVAL)
+    }
+
     #[inline(always)]
     fn row(&self, perspective: usize, color: usize, ty: usize, sq: usize) -> &[i16] {
         let f = (((color != perspective) as usize) * 6 + ty) * 64 + (sq ^ (56 * perspective));
@@ -224,22 +272,13 @@ impl Network {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     unsafe fn eval_cached_avx2(&self, c: &mut Cache, pos: &Position) -> i32 {
-        self.eval_cached(c, pos)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn eval_scratch_avx2(&self, pos: &Position) -> i32 {
-        self.eval_scratch_impl(pos)
+        self.sync(c, pos);
+        let us = pos.side.index();
+        self.output_avx2(&c.acc[us], &c.acc[us ^ 1], pos)
     }
 
     /// Reference evaluation without any cache (oracle for tests and `bench`-style probes).
     pub fn eval_scratch(&self, pos: &Position) -> i32 {
-        #[cfg(target_arch = "x86_64")]
-        if self.avx2 {
-            // SAFETY: avx2 availability was checked at load time.
-            return unsafe { self.eval_scratch_avx2(pos) };
-        }
         self.eval_scratch_impl(pos)
     }
 
@@ -317,6 +356,31 @@ mod tests {
             v.extend_from_slice(&out_b.to_le_bytes());
         }
         v
+    }
+
+    #[test]
+    fn rejects_unknown_network_version() {
+        let mut bytes = blank(0, 0, 0);
+        bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert!(Network::parse(&bytes).err().unwrap().contains("unsupported net version"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_output_matches_scalar_oracle() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let net = random_net(0xA5A5_1234_9876_FEDC);
+        let positions = playout(0xBADC_0FFE_E0DD_F00D, 240, STARTS[0]);
+        let mut scalar_cache = Cache { id: 0, bb: [0; 12], acc: [[0; HIDDEN]; 2] };
+        let mut vector_cache = Cache { id: 0, bb: [0; 12], acc: [[0; HIDDEN]; 2] };
+        for pos in positions {
+            let scalar = net.eval_cached(&mut scalar_cache, &pos);
+            // SAFETY: the test checked the current CPU's AVX2 feature above.
+            let vector = unsafe { net.eval_cached_avx2(&mut vector_cache, &pos) };
+            assert_eq!(vector, scalar, "AVX2 mismatch at {}", pos.to_fen());
+        }
     }
 
     #[test]
